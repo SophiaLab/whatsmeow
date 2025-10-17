@@ -8,6 +8,7 @@ package whatsmeow
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"slices"
@@ -18,6 +19,7 @@ import (
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waVnameCert"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -204,11 +206,13 @@ func (cli *Client) GetUserInfo(jids []types.JID) (map[types.JID]types.UserInfo, 
 		{Tag: "status"},
 		{Tag: "picture"},
 		{Tag: "devices", Attrs: waBinary.Attrs{"version": "2"}},
+		{Tag: "lid"},
 	})
 	if err != nil {
 		return nil, err
 	}
 	respData := make(map[types.JID]types.UserInfo, len(jids))
+	mappings := make([]store.LIDMapping, 0, len(jids))
 	for _, child := range list.GetChildren() {
 		jid, jidOK := child.Attrs["jid"].(types.JID)
 		if child.Tag != "user" || !jidOK {
@@ -223,11 +227,26 @@ func (cli *Client) GetUserInfo(jids []types.JID) (map[types.JID]types.UserInfo, 
 		info.Status = string(status)
 		info.PictureID, _ = child.GetChildByTag("picture").Attrs["id"].(string)
 		info.Devices = parseDeviceList(jid, child.GetChildByTag("devices"))
+
+		lidTag := child.GetChildByTag("lid")
+		info.LID = lidTag.AttrGetter().OptionalJIDOrEmpty("val")
+
+		if !info.LID.IsEmpty() {
+			mappings = append(mappings, store.LIDMapping{PN: jid, LID: info.LID})
+		}
+
 		if verifiedName != nil {
 			cli.updateBusinessName(context.TODO(), jid, nil, verifiedName.Details.GetVerifiedName())
 		}
 		respData[jid] = info
 	}
+
+	err = cli.Store.LIDs.PutManyLIDMappings(context.TODO(), mappings)
+	if err != nil {
+		// not worth returning on the error, instead just post a log
+		cli.Log.Errorf("Failed to place LID mappings from USync call")
+	}
+
 	return respData, nil
 }
 
@@ -338,8 +357,8 @@ func (cli *Client) parseBusinessProfile(node *waBinary.Node) (*types.BusinessPro
 	if !ok {
 		return nil, errors.New("missing jid in business profile")
 	}
-	address := string(profileNode.GetChildByTag("address").Content.([]byte))
-	email := string(profileNode.GetChildByTag("email").Content.([]byte))
+	address, _ := profileNode.GetChildByTag("address").Content.([]byte)
+	email, _ := profileNode.GetChildByTag("email").Content.([]byte)
 	businessHour := profileNode.GetChildByTag("business_hours")
 	businessHourTimezone := businessHour.AttrGetter().String("timezone")
 	businessHoursConfigs := businessHour.GetChildren()
@@ -348,7 +367,7 @@ func (cli *Client) parseBusinessProfile(node *waBinary.Node) (*types.BusinessPro
 		if config.Tag != "business_hours_config" {
 			continue
 		}
-		dow := config.AttrGetter().String("dow")
+		dow := config.AttrGetter().String("day_of_week")
 		mode := config.AttrGetter().String("mode")
 		openTime := config.AttrGetter().String("open_time")
 		closeTime := config.AttrGetter().String("close_time")
@@ -366,21 +385,23 @@ func (cli *Client) parseBusinessProfile(node *waBinary.Node) (*types.BusinessPro
 			continue
 		}
 		id := category.AttrGetter().String("id")
-		name := string(category.Content.([]byte))
+		name, _ := category.Content.([]byte)
 		categories = append(categories, types.Category{
 			ID:   id,
-			Name: name,
+			Name: string(name),
 		})
 	}
 	profileOptionsNode := profileNode.GetChildByTag("profile_options")
 	profileOptions := make(map[string]string)
 	for _, option := range profileOptionsNode.GetChildren() {
-		profileOptions[option.Tag] = string(option.Content.([]byte))
+		optValueBytes, _ := option.Content.([]byte)
+		profileOptions[option.Tag] = string(optValueBytes)
+		// TODO parse bot_fields
 	}
 	return &types.BusinessProfile{
 		JID:                   jid,
-		Email:                 email,
-		Address:               address,
+		Email:                 string(email),
+		Address:               string(address),
 		Categories:            categories,
 		ProfileOptions:        profileOptions,
 		BusinessHoursTimeZone: businessHourTimezone,
@@ -524,9 +545,18 @@ func (cli *Client) GetProfilePictureInfo(jid types.JID, params *GetProfilePictur
 	} else {
 		to = types.ServerJID
 		target = jid
+		var pictureContent []waBinary.Node
+		if token, _ := cli.Store.PrivacyTokens.GetPrivacyToken(context.TODO(), jid); token != nil {
+			pictureContent = []waBinary.Node{{
+				Tag:     "tctoken",
+				Content: token.Token,
+			}}
+		}
+
 		content = []waBinary.Node{{
-			Tag:   "picture",
-			Attrs: attrs,
+			Tag:     "picture",
+			Attrs:   attrs,
+			Content: pictureContent,
 		}}
 	}
 	resp, err := cli.sendIQ(infoQuery{
@@ -561,11 +591,14 @@ func (cli *Client) GetProfilePictureInfo(jid types.JID, params *GetProfilePictur
 	ag := picture.AttrGetter()
 	if ag.OptionalInt("status") == 304 {
 		return nil, nil
+	} else if ag.OptionalInt("status") == 204 {
+		return nil, ErrProfilePictureNotSet
 	}
 	info.ID = ag.String("id")
 	info.URL = ag.String("url")
 	info.Type = ag.String("type")
 	info.DirectPath = ag.String("direct_path")
+	info.Hash, _ = base64.StdEncoding.DecodeString(ag.OptionalString("hash"))
 	if !ag.OK() {
 		return &info, ag.Error()
 	}
@@ -671,11 +704,22 @@ func parseDeviceList(user types.JID, deviceNode waBinary.Node) []types.JID {
 	devices := make([]types.JID, 0, len(children))
 	for _, device := range children {
 		deviceID, ok := device.AttrGetter().GetInt64("id", true)
+		isHosted := device.AttrGetter().Bool("is_hosted")
 		if device.Tag != "device" || !ok {
 			continue
 		}
 		user.Device = uint16(deviceID)
-		devices = append(devices, user)
+		if isHosted {
+			hostedUser := user
+			if user.Server == types.HiddenUserServer {
+				hostedUser.Server = types.HostedLIDServer
+			} else {
+				hostedUser.Server = types.HostedServer
+			}
+			devices = append(devices, hostedUser)
+		} else {
+			devices = append(devices, user)
+		}
 	}
 	return devices
 }
@@ -772,6 +816,8 @@ func (cli *Client) usync(ctx context.Context, jids []types.JID, mode, context st
 				Content: jid.String(),
 			}}
 		case types.DefaultUserServer, types.HiddenUserServer:
+			// NOTE: You can pass in an LID with a JID (<lid jid=...> user node)
+			// Not sure if you can just put the LID in the jid tag here (works for <devices> queries mainly)
 			userList[i].Attrs = waBinary.Attrs{"jid": jid}
 			if jid.IsBot() {
 				var personaID string

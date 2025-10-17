@@ -11,13 +11,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/ptr"
+
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
 func (cli *Client) handleReceipt(node *waBinary.Node) {
-	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)()
+	var cancelled bool
+	defer cli.maybeDeferredAck(cli.BackgroundEventCtx, node)(&cancelled)
 	receipt, err := cli.parseReceipt(node)
 	if err != nil {
 		cli.Log.Warnf("Failed to parse receipt: %v", err)
@@ -30,7 +34,7 @@ func (cli *Client) handleReceipt(node *waBinary.Node) {
 				}
 			}()
 		}
-		cli.dispatchEvent(receipt)
+		cancelled = cli.dispatchEvent(receipt)
 	}
 }
 
@@ -50,7 +54,7 @@ func (cli *Client) handleGroupedReceipt(partialReceipt events.Receipt, participa
 			cli.Log.Warnf("Failed to parse user node %s in grouped receipt: %v", child.XMLString(), ag.Error())
 			continue
 		}
-		go cli.dispatchEvent(&receipt)
+		cli.dispatchEvent(&receipt)
 	}
 }
 
@@ -97,21 +101,51 @@ func (cli *Client) parseReceipt(node *waBinary.Node) (*events.Receipt, error) {
 	return &receipt, nil
 }
 
-func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func() {
+func (cli *Client) backgroundIfAsyncAck(fn func()) {
 	if cli.SynchronousAck {
-		return func() {
-			if ctx.Err() != nil {
-				return
-			}
-			cli.sendAck(node)
-		}
+		fn()
 	} else {
-		go cli.sendAck(node)
-		return func() {}
+		go fn()
 	}
 }
 
-func (cli *Client) sendAck(node *waBinary.Node) {
+func (cli *Client) maybeDeferredAck(ctx context.Context, node *waBinary.Node) func(cancelled ...*bool) {
+	if cli.SynchronousAck {
+		return func(cancelled ...*bool) {
+			isCancelled := len(cancelled) > 0 && ptr.Val(cancelled[0])
+			if ctx.Err() != nil || isCancelled {
+				zerolog.Ctx(ctx).Debug().
+					AnErr("ctx_err", ctx.Err()).
+					Bool("cancelled", isCancelled).
+					Str("node_tag", node.Tag).
+					Msg("Not sending ack for node")
+				return
+			}
+			cli.sendAck(node, 0)
+		}
+	} else {
+		go cli.sendAck(node, 0)
+		return func(...*bool) {}
+	}
+}
+
+const (
+	NackParsingError                 = 487
+	NackUnrecognizedStanza           = 488
+	NackUnrecognizedStanzaClass      = 489
+	NackUnrecognizedStanzaType       = 490
+	NackInvalidProtobuf              = 491
+	NackInvalidHostedCompanionStanza = 493
+	NackMissingMessageSecret         = 495
+	NackSignalErrorOldCounter        = 496
+	NackMessageDeletedOnPeer         = 499
+	NackUnhandledError               = 500
+	NackUnsupportedAdminRevoke       = 550
+	NackUnsupportedLIDGroup          = 551
+	NackDBOperationFailed            = 552
+)
+
+func (cli *Client) sendAck(node *waBinary.Node, error int) {
 	attrs := waBinary.Attrs{
 		"class": node.Tag,
 		"id":    node.Attrs["id"],
@@ -134,6 +168,9 @@ func (cli *Client) sendAck(node *waBinary.Node) {
 	}
 	if receiptType, ok := node.Attrs["type"]; node.Tag != "message" && ok {
 		attrs["type"] = receiptType
+	}
+	if error != 0 {
+		attrs["error"] = error
 	}
 	err := cli.sendNode(waBinary.Node{
 		Tag:   "ack",
@@ -223,23 +260,29 @@ func (cli *Client) SetForceActiveDeliveryReceipts(active bool) {
 	}
 }
 
-func (cli *Client) sendMessageReceipt(info *types.MessageInfo) {
+func buildBaseReceipt(id string, node *waBinary.Node) waBinary.Attrs {
 	attrs := waBinary.Attrs{
-		"id": info.ID,
+		"id": id,
+		"to": node.Attrs["from"],
 	}
+	if recipient, ok := node.Attrs["recipient"]; ok {
+		attrs["recipient"] = recipient
+	}
+	if participant, ok := node.Attrs["participant"]; ok {
+		attrs["participant"] = participant
+	}
+	return attrs
+}
+
+func (cli *Client) sendMessageReceipt(info *types.MessageInfo, node *waBinary.Node) {
+	attrs := buildBaseReceipt(info.ID, node)
 	if info.IsFromMe {
 		attrs["type"] = string(types.ReceiptTypeSender)
+		if info.Type == "peer_msg" {
+			attrs["type"] = string(types.ReceiptTypePeerMsg)
+		}
 	} else if cli.sendActiveReceipts.Load() == 0 {
 		attrs["type"] = string(types.ReceiptTypeInactive)
-	}
-	attrs["to"] = info.Chat
-	if info.IsGroup {
-		attrs["participant"] = info.Sender
-	} else if info.IsFromMe {
-		attrs["recipient"] = info.Sender
-	} else {
-		// Override the to attribute with the JID version with a device number
-		attrs["to"] = info.Sender
 	}
 	err := cli.sendNode(waBinary.Node{
 		Tag:   "receipt",

@@ -166,6 +166,7 @@ func (proc *Processor) decodeMutations(ctx context.Context, mutations []*waServe
 		out.Mutations = append(out.Mutations, Mutation{
 			Operation: mutation.GetOperation(),
 			Action:    syncAction.GetValue(),
+			Version:   syncAction.GetVersion(),
 			Index:     index,
 			IndexMAC:  indexMAC,
 			ValueMAC:  valueMAC,
@@ -288,7 +289,7 @@ func (proc *Processor) DecodePatches(ctx context.Context, list *PatchList, initi
 
 		if validateMACs {
 			var keys ExpandedAppStateKeys
-			keys, err = proc.validateSnapshotMAC(ctx, list.Name, currentState, patch.GetKeyID().GetID(), patch.GetSnapshotMac())
+			keys, err = proc.validateSnapshotMAC(ctx, list.Name, currentState, patch.GetKeyID().GetID(), patch.GetSnapshotMAC())
 			if err != nil {
 				return
 			}
