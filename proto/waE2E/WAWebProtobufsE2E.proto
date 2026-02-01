@@ -531,6 +531,7 @@ message PaymentInviteMessage {
 
 	optional ServiceType serviceType = 1;
 	optional int64 expiryTimestamp = 2;
+	optional bool incentiveEligible = 3;
 }
 
 message HighlyStructuredMessage {
@@ -1117,6 +1118,8 @@ message ContextInfo {
 		}
 
 		optional AudienceType audienceType = 1;
+		optional string listName = 2;
+		optional string listEmoji = 3;
 	}
 
 	message DataSharingContext {
@@ -1151,6 +1154,7 @@ message ContextInfo {
 		optional string newsletterName = 3;
 		optional ContentType contentType = 4;
 		optional string accessibilityText = 5;
+		optional string profileName = 6;
 	}
 
 	message ExternalAdReplyInfo {
@@ -1567,6 +1571,8 @@ message Message {
 	optional PollCreationMessage pollCreationMessageV5 = 111;
 	optional NewsletterFollowerInviteMessage newsletterFollowerInviteMessageV2 = 113;
 	optional PollResultSnapshotMessage pollResultSnapshotMessageV3 = 115;
+	optional FutureProofMessage newsletterAdminProfileMessage = 116;
+	optional FutureProofMessage newsletterAdminProfileMessageV2 = 117;
 }
 
 message AlbumMessage {
@@ -2024,7 +2030,6 @@ message URLMetadata {
 message PaymentExtendedMetadata {
 	optional uint32 type = 1;
 	optional string platform = 2;
-	optional string messageParamsJSON = 3;
 }
 
 message MMSThumbnailMetadata {
@@ -2057,6 +2062,7 @@ message ContactMessage {
 	optional string displayName = 1;
 	optional string vcard = 16;
 	optional ContextInfo contextInfo = 17;
+	optional bool isSelfContact = 18;
 }
 
 message SenderKeyDistributionMessage {
